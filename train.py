@@ -24,6 +24,8 @@ S0 = 2          # initial discretization steps
 S1 = 150        # final discretization steps
 EMA_DECAY = 0.999
 BATCH_SIZE = 512
+MICRO_BATCH = 64
+GRAD_ACCUM_STEPS = BATCH_SIZE // MICRO_BATCH  # 8
 LR = 1e-4
 TOTAL_STEPS = 800_000
 LOG_EVERY = 500
@@ -67,7 +69,7 @@ def get_dataloader():
     dataset = datasets.CIFAR10(root=DATA_DIR, train=True, download=True, transform=transform)
     loader = DataLoader(
         dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=MICRO_BATCH,
         shuffle=True,
         num_workers=4,
         pin_memory=True,
@@ -98,50 +100,57 @@ def train():
     print(f"Model parameters: {param_count:,}")
 
     optimizer = torch.optim.Adam(online.parameters(), lr=LR)
+    scaler = torch.amp.GradScaler('cuda')
     loader = get_dataloader()
     data_iter = infinite_loader(loader)
 
     running_loss = 0.0
 
     for step in tqdm(range(1, TOTAL_STEPS + 1), desc="Training"):
-        x, _ = next(data_iter)
-        x = x.to(device)
-
         # Current number of discretization steps
         N = n_steps_schedule(step, TOTAL_STEPS)
-
-        # Compute sigma schedule for N steps
         sigmas = karras_schedule(N).to(device)
 
-        # Sample random index n in {0, ..., N-2} -> adjacent pair (t_{n+1}, t_n)
-        n = torch.randint(0, N - 1, (x.shape[0],), device=device)
-        t_next = sigmas[n]      # t_{n+1} (larger sigma)
-        t_curr = sigmas[n + 1]  # t_n     (smaller sigma)
-
-        # Same noise, different scales
-        z = torch.randn_like(x)
-        x_next = x + t_next[:, None, None, None] * z   # noisier
-        x_curr = x + t_curr[:, None, None, None] * z   # less noisy
-
-        # Online model: f_θ(x_{n+1}, t_{n+1})
-        pred_online = online(x_next, t_next)
-
-        # Target model (no grad): f_{θ⁻}(x_n, t_n)
-        with torch.no_grad():
-            pred_target = target(x_curr, t_curr)
-
-        loss = pseudo_huber_loss(pred_online, pred_target)
-
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        accum_loss = 0.0
+
+        for _ in range(GRAD_ACCUM_STEPS):
+            x, _ = next(data_iter)
+            x = x.to(device)
+
+            # Sample random index n in {0, ..., N-2} -> adjacent pair (t_{n+1}, t_n)
+            n = torch.randint(0, N - 1, (x.shape[0],), device=device)
+            t_next = sigmas[n]      # t_{n+1} (larger sigma)
+            t_curr = sigmas[n + 1]  # t_n     (smaller sigma)
+
+            # Same noise, different scales
+            z = torch.randn_like(x)
+            x_next = x + t_next[:, None, None, None] * z   # noisier
+            x_curr = x + t_curr[:, None, None, None] * z   # less noisy
+
+            with torch.amp.autocast('cuda'):
+                # Online model: f_θ(x_{n+1}, t_{n+1})
+                pred_online = online(x_next, t_next)
+
+                # Target model (no grad): f_{θ⁻}(x_n, t_n)
+                with torch.no_grad():
+                    pred_target = target(x_curr, t_curr)
+
+                loss = pseudo_huber_loss(pred_online, pred_target)
+                loss = loss / GRAD_ACCUM_STEPS
+
+            scaler.scale(loss).backward()
+            accum_loss += loss.item()
+
+        scaler.step(optimizer)
+        scaler.update()
 
         # EMA update of target model
         with torch.no_grad():
             for p_online, p_target in zip(online.parameters(), target.parameters()):
                 p_target.data.lerp_(p_online.data, 1.0 - EMA_DECAY)
 
-        running_loss += loss.item()
+        running_loss += accum_loss
 
         if step % LOG_EVERY == 0:
             avg = running_loss / LOG_EVERY
@@ -155,6 +164,7 @@ def train():
                 "online_state_dict": online.state_dict(),
                 "target_state_dict": target.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
             }, path)
             print(f"Saved checkpoint: {path}")
 
@@ -165,6 +175,7 @@ def train():
         "online_state_dict": online.state_dict(),
         "target_state_dict": target.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
     }, path)
     print(f"Training complete. Final checkpoint: {path}")
 
