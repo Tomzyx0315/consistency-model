@@ -7,7 +7,7 @@ Implementation of Consistency Training (CT) from Song et al. (2023) for uncondit
 ## File Structure
 
 - `model.py` — UNet with time conditioning + ConsistencyModel wrapper (c_skip/c_out parameterization)
-- `train.py` — Consistency Training loop with curriculum scheduling, EMA target, pseudo-Huber loss
+- `train.py` — Consistency Training loop with DDP multi-GPU support, curriculum scheduling, EMA target, pseudo-Huber loss
 - `sample.py` — One-step sampling: z * σ_max → f_θ → image grid
 - `requirements.txt` — torch, torchvision, tqdm
 
@@ -23,7 +23,11 @@ Implementation of Consistency Training (CT) from Song et al. (2023) for uncondit
 |-----------|-------|
 | σ_data | 0.5 |
 | σ_min / σ_max | 0.002 / 80.0 |
-| Batch size | 512 |
+| ρ (Karras schedule) | 7.0 |
+| Effective batch size | 2048 |
+| Micro batch size | 256 |
+| Gradient accumulation | 2 steps per GPU (with 4 GPUs) |
+| GPUs | 4 (scales automatically) |
 | Learning rate | 1e-4 (Adam) |
 | EMA decay | 0.999 |
 | Total steps | 800k |
@@ -36,8 +40,11 @@ Implementation of Consistency Training (CT) from Song et al. (2023) for uncondit
 # Install dependencies
 pip install -r requirements.txt
 
-# Train
-python train.py
+# Train (4 GPUs)
+torchrun --nproc_per_node=4 train.py
+
+# Train (single GPU — grad_accum auto-adjusts to 8)
+torchrun --nproc_per_node=1 train.py
 
 # Sample (after training)
 python sample.py --checkpoint checkpoints/consistency_final.pt --n_samples 64 --output samples.png
@@ -45,7 +52,13 @@ python sample.py --checkpoint checkpoints/consistency_final.pt --n_samples 64 --
 
 ## Development Notes
 
-- Checkpoints save to `./checkpoints/` every 50k steps
-- CIFAR-10 downloads to `./data/` on first run
-- Training logs loss every 500 steps
+- **DDP**: Multi-GPU training via `DistributedDataParallel`; `torchrun` sets up process groups automatically
+- **Gradient accumulation**: Effective batch 2048 = 256 micro-batch × 2 accum × 4 GPUs (auto-adjusts with GPU count)
+- **`no_sync` optimization**: Intermediate micro-batches skip all-reduce; only the final micro-batch synchronizes gradients
+- **AMP**: Mixed precision training with `torch.amp.autocast` and `GradScaler`
+- **Target model**: Not wrapped in DDP (no gradients, EMA-only); stays as a plain module
+- Checkpoints save to `./checkpoints/` every 50k steps (includes online, target, optimizer, and scaler state dicts)
+- Checkpoints store unwrapped `online.module.state_dict()` so they load directly in `sample.py` without key mismatches
+- CIFAR-10 downloads to `./data/` on first run (rank 0 downloads, others wait at barrier)
+- Training logs loss every 500 steps (rank 0 only)
 - Use target (EMA) model weights for sampling

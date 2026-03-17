@@ -1,12 +1,16 @@
-"""Consistency Training for CIFAR-10."""
+"""Consistency Training for CIFAR-10 (Multi-GPU DDP)."""
 
 import copy
 import math
 import os
+from contextlib import nullcontext
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
@@ -23,9 +27,8 @@ RHO = 7.0
 S0 = 2          # initial discretization steps
 S1 = 150        # final discretization steps
 EMA_DECAY = 0.999
-BATCH_SIZE = 512
-MICRO_BATCH = 64
-GRAD_ACCUM_STEPS = BATCH_SIZE // MICRO_BATCH  # 8
+BATCH_SIZE = 2048
+MICRO_BATCH = 256
 LR = 1e-4
 TOTAL_STEPS = 800_000
 LOG_EVERY = 500
@@ -34,6 +37,19 @@ DATA_DIR = "./data"
 CKPT_DIR = "./checkpoints"
 D = 3 * 32 * 32  # data dimensionality
 HUBER_C = 0.00054 * math.sqrt(D)
+
+
+def setup_ddp():
+    """Initialize DDP process group and set the CUDA device."""
+    dist.init_process_group("nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+
+def cleanup_ddp():
+    """Destroy the DDP process group."""
+    dist.destroy_process_group()
 
 
 def karras_schedule(n_steps, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, rho=RHO):
@@ -67,46 +83,69 @@ def get_dataloader():
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),  # [-1, 1]
     ])
     dataset = datasets.CIFAR10(root=DATA_DIR, train=True, download=True, transform=transform)
+    sampler = DistributedSampler(dataset)
     loader = DataLoader(
         dataset,
         batch_size=MICRO_BATCH,
-        shuffle=True,
+        sampler=sampler,
         num_workers=4,
         pin_memory=True,
         drop_last=True,
         persistent_workers=True,
     )
-    return loader
+    return loader, sampler
 
 
-def infinite_loader(loader):
-    """Yield batches forever."""
+def infinite_loader(loader, sampler):
+    """Yield batches forever, re-shuffling each epoch via the sampler."""
+    epoch = 0
     while True:
+        sampler.set_epoch(epoch)
         yield from loader
+        epoch += 1
 
 
 def train():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # DDP setup
+    local_rank = setup_ddp()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{local_rank}")
 
-    os.makedirs(CKPT_DIR, exist_ok=True)
+    grad_accum_steps = BATCH_SIZE // (MICRO_BATCH * world_size)
+
+    if rank == 0:
+        print(f"DDP training with {world_size} GPU(s)")
+        print(f"Effective batch size: {BATCH_SIZE} = {MICRO_BATCH} micro-batch × {grad_accum_steps} accum × {world_size} GPUs")
+        os.makedirs(CKPT_DIR, exist_ok=True)
 
     # Models
     online = ConsistencyModel(sigma_data=SIGMA_DATA, sigma_min=SIGMA_MIN).to(device)
     target = copy.deepcopy(online)
     target.requires_grad_(False)
 
-    param_count = sum(p.numel() for p in online.parameters())
-    print(f"Model parameters: {param_count:,}")
+    # Wrap online model with DDP
+    online = DDP(online, device_ids=[local_rank])
+
+    if rank == 0:
+        param_count = sum(p.numel() for p in online.parameters())
+        print(f"Model parameters: {param_count:,}")
 
     optimizer = torch.optim.Adam(online.parameters(), lr=LR)
     scaler = torch.amp.GradScaler('cuda')
-    loader = get_dataloader()
-    data_iter = infinite_loader(loader)
+
+    # Rank 0 downloads data first, then others proceed
+    if rank == 0:
+        datasets.CIFAR10(root=DATA_DIR, train=True, download=True)
+    dist.barrier()
+
+    loader, sampler = get_dataloader()
+    data_iter = infinite_loader(loader, sampler)
 
     running_loss = 0.0
 
-    for step in tqdm(range(1, TOTAL_STEPS + 1), desc="Training"):
+    pbar = tqdm(range(1, TOTAL_STEPS + 1), desc="Training", disable=(rank != 0))
+    for step in pbar:
         # Current number of discretization steps
         N = n_steps_schedule(step, TOTAL_STEPS)
         sigmas = karras_schedule(N).to(device)
@@ -114,7 +153,7 @@ def train():
         optimizer.zero_grad()
         accum_loss = 0.0
 
-        for _ in range(GRAD_ACCUM_STEPS):
+        for micro_step in range(grad_accum_steps):
             x, _ = next(data_iter)
             x = x.to(device)
 
@@ -128,18 +167,22 @@ def train():
             x_next = x + t_next[:, None, None, None] * z   # noisier
             x_curr = x + t_curr[:, None, None, None] * z   # less noisy
 
-            with torch.amp.autocast('cuda'):
-                # Online model: f_θ(x_{n+1}, t_{n+1})
-                pred_online = online(x_next, t_next)
+            # Skip all-reduce on intermediate micro-batches
+            sync_context = online.no_sync() if micro_step < grad_accum_steps - 1 else nullcontext()
 
-                # Target model (no grad): f_{θ⁻}(x_n, t_n)
-                with torch.no_grad():
-                    pred_target = target(x_curr, t_curr)
+            with sync_context:
+                with torch.amp.autocast(device_type='cuda'):
+                    # Online model: f_θ(x_{n+1}, t_{n+1})
+                    pred_online = online(x_next, t_next)
 
-                loss = pseudo_huber_loss(pred_online, pred_target)
-                loss = loss / GRAD_ACCUM_STEPS
+                    # Target model (no grad): f_{θ⁻}(x_n, t_n)
+                    with torch.no_grad():
+                        pred_target = target(x_curr, t_curr)
 
-            scaler.scale(loss).backward()
+                    loss = pseudo_huber_loss(pred_online, pred_target)
+                    loss = loss / grad_accum_steps
+
+                scaler.scale(loss).backward()
             accum_loss += loss.item()
 
         scaler.step(optimizer)
@@ -147,37 +190,42 @@ def train():
 
         # EMA update of target model
         with torch.no_grad():
-            for p_online, p_target in zip(online.parameters(), target.parameters()):
+            for p_online, p_target in zip(online.module.parameters(), target.parameters()):
                 p_target.data.lerp_(p_online.data, 1.0 - EMA_DECAY)
 
         running_loss += accum_loss
 
-        if step % LOG_EVERY == 0:
+        if step % LOG_EVERY == 0 and rank == 0:
             avg = running_loss / LOG_EVERY
             print(f"Step {step}/{TOTAL_STEPS} | N={N} | Loss: {avg:.4f}")
             running_loss = 0.0
 
         if step % SAVE_EVERY == 0:
-            path = os.path.join(CKPT_DIR, f"consistency_step{step}.pt")
-            torch.save({
-                "step": step,
-                "online_state_dict": online.state_dict(),
-                "target_state_dict": target.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-            }, path)
-            print(f"Saved checkpoint: {path}")
+            if rank == 0:
+                path = os.path.join(CKPT_DIR, f"consistency_step{step}.pt")
+                torch.save({
+                    "step": step,
+                    "online_state_dict": online.module.state_dict(),
+                    "target_state_dict": target.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                }, path)
+                print(f"Saved checkpoint: {path}")
+            dist.barrier()
 
     # Save final
-    path = os.path.join(CKPT_DIR, "consistency_final.pt")
-    torch.save({
-        "step": TOTAL_STEPS,
-        "online_state_dict": online.state_dict(),
-        "target_state_dict": target.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
-    }, path)
-    print(f"Training complete. Final checkpoint: {path}")
+    if rank == 0:
+        path = os.path.join(CKPT_DIR, "consistency_final.pt")
+        torch.save({
+            "step": TOTAL_STEPS,
+            "online_state_dict": online.module.state_dict(),
+            "target_state_dict": target.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+        }, path)
+        print(f"Training complete. Final checkpoint: {path}")
+
+    cleanup_ddp()
 
 
 if __name__ == "__main__":
