@@ -24,8 +24,8 @@ Implementation of Consistency Training (CT) from Song et al. (2023) for uncondit
 | σ_data | 0.5 |
 | σ_min / σ_max | 0.002 / 80.0 |
 | ρ (Karras schedule) | 7.0 |
-| Effective batch size | 2048 |
-| Micro batch size | 256 |
+| Effective batch size | 4096 |
+| Micro batch size | 512 |
 | Gradient accumulation | 2 steps per GPU (with 4 GPUs) |
 | GPUs | 4 (scales automatically) |
 | Learning rate | 1e-4 (Adam) |
